@@ -29,7 +29,7 @@ help:
 	@echo "  make test        - pytest"
 
 .PHONY: setup
-setup: venv python-deps frontend-deps install-hooks dev
+setup: venv python-deps frontend-deps dev
 
 .PHONY: venv
 venv:
@@ -53,15 +53,6 @@ python-deps: venv
 frontend-deps:
 	@echo ">> Installerar frontend-deps (yarn)"
 	cd $(FRONTEND_DIR) && yarn install
-
-.PHONY: install-hooks
-install-hooks:
-	@echo ">> Säkerställer git-repo och installerar pre-commit-hook"
-	@if [ ! -d .git ]; then git init && git add . && git commit -m "init" || true; fi
-	@mkdir -p .git/hooks
-	@printf '#!/usr/bin/env bash\nset -euo pipefail\nROOT="$$(git rev-parse --show-toplevel)"\nexec "$$ROOT/$(BACKEND_DIR)/.venv/bin/pre-commit" run --hook-stage pre-commit\n' > .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@echo "✓ Hook klar: .git/hooks/pre-commit"
 
 .PHONY: dev
 dev:
