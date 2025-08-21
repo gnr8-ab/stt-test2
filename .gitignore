@@ -1,0 +1,38 @@
+# Node/Yarn
+node_modules/
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+
+# Vite/React
+dist/
+.vite/
+
+# Python
+__pycache__/
+.venv/
+.env
+server/.env
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Windows MOTW artifacts (Zone.Identifier)
+*:Zone.Identifier
+*\357\200\272Zone.Identifier
+
+# Misc
+*.log
+*.tmp
+*.swp
+*.swo
