@@ -9,11 +9,6 @@ export function useRealtimeTranscription() {
   const [unstableText, setUnstableText] = useState('')
   const [stableText, setStableText] = useState('')
 
-  const reset = useCallback(() => {
-    setUnstableText('')
-    setStableText('')
-  }, [])
-
   const stop = useCallback(() => {
     setRunning(false)
     try { dcRef.current?.close() } catch {}
@@ -39,14 +34,12 @@ export function useRealtimeTranscription() {
           setUnstableText('')
           break
         }
-        default:
-          break
+        default: break
       }
     } catch {}
   }, [unstableText])
 
   const start = useCallback(async () => {
-    reset()
     const res = await fetch('/api/ephemeral', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -61,25 +54,16 @@ export function useRealtimeTranscription() {
       bundlePolicy: 'max-bundle'
     })
     pcRef.current = pc
-    pc.addEventListener('iceconnectionstatechange', () => console.log('ICE:', pc.iceConnectionState))
-
     const dc = pc.createDataChannel('oai-events')
     dcRef.current = dc
     dc.addEventListener('open', () => {
-      const msg = {
+      dc.send(JSON.stringify({
         type: 'session.update',
         session: {
           input_audio_transcription: { model: eph.transcription_model, language: eph.language },
-          turn_detection: {
-            type: 'server_vad',
-            silence_duration_ms: 200,
-            prefix_padding_ms: 300,
-            threshold: 0.5,
-            create_response: false
-          }
+          turn_detection: { type: 'server_vad', silence_duration_ms: 200, prefix_padding_ms: 300, threshold: 0.5, create_response: false }
         }
-      }
-      dc.send(JSON.stringify(msg))
+      }))
     })
     dc.addEventListener('message', onServerEvent)
 
@@ -103,7 +87,7 @@ export function useRealtimeTranscription() {
     const answer = await sdpResponse.text()
     await pc.setRemoteDescription({ type: 'answer', sdp: answer })
     setRunning(true)
-  }, [onServerEvent, reset])
+  }, [onServerEvent])
 
   return { isRunning, unstableText, stableText, start, stop }
 }

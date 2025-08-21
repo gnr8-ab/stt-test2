@@ -1,11 +1,20 @@
 from __future__ import annotations
 import os
+import json
 from typing import Optional
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+import asyncio
+import base64
+import websockets
+import contextlib
+import logging
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("ws-live")
 
 load_dotenv()
 
@@ -73,7 +82,9 @@ async def _create_session_token(realtime_model: str, transcribe_model: str, lang
     )
 
 @app.post("/api/ephemeral", response_model=EphemeralResponse)
-async def ephemeral(req: EphemeralRequest):
+async def ephemeral(req: EphemeralRequest | None = Body(default=None)):
+    if req is None:
+        req = EphemeralRequest()
     lang = req.language or LANGUAGE
     t_model = req.transcribe_model or TRANSCRIBE_MODEL
     r_model = req.realtime_model or REALTIME_MODEL
@@ -82,3 +93,205 @@ async def ephemeral(req: EphemeralRequest):
 @app.get("/api/config")
 async def config():
     return {"realtime_model": REALTIME_MODEL, "transcribe_model": TRANSCRIBE_MODEL, "language": LANGUAGE}
+
+# --- WS pipeline för Live (ord-för-ord) ---
+@app.websocket("/ws/live")
+async def ws_live(ws: WebSocket):
+    await ws.accept()
+    if not OPENAI_API_KEY:
+        await ws.send_json({"type": "error", "message": "OPENAI_API_KEY saknas"})
+        await ws.close()
+        return
+
+    oai_url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
+    headers = [
+        ("Authorization", f"Bearer {OPENAI_API_KEY}"),
+        ("OpenAI-Beta", "realtime=v1"),
+    ]
+
+    try:
+        async with websockets.connect(
+            oai_url,
+            additional_headers=headers,
+            ping_interval=20,
+            ping_timeout=20,
+            max_size=8_000_000,
+        ) as oai:
+            # --- Initiera sessionen ---
+            session_update = {
+                "type": "session.update",
+                "session": {
+                    # Viktigt: pcm16 = 24 kHz mono
+                    "input_audio_format": "pcm16",
+                    "input_audio_transcription": {
+                        "model": TRANSCRIBE_MODEL,
+                        "language": LANGUAGE,
+                    },
+                    # OBS: använd server_vad för live-deltas; modellen skapar INTE svar själv
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "silence_duration_ms": 350,
+                        "prefix_padding_ms": 200,
+                        "threshold": 0.5,
+                        "create_response": False,
+                    },
+                },
+            }
+            await oai.send(json.dumps(session_update))
+            await ws.send_json({
+                "type": "log",
+                "where": "server",
+                "msg": "session.update sent (pcm16/24kHz, server_vad, create_response=False)"
+            })
+
+            # Delad status mellan pumparna: spåra om en response är 'in flight'
+            response_state = {"inflight": False}
+
+            async def pump_client_to_oai():
+                """
+                Ta emot batchede base64-PCM16 från klienten.
+                Commit + response.create endast när vi har >= MIN_MS och ingen response pågår.
+                """
+                MIN_MS = 120  # OpenAI kräver >=100ms; vi tar lite marginal
+                accum_bytes = 0
+                commits = 0
+
+                def b64len_to_bytes(n: int) -> int:
+                    # Base64 ~ 4 tecken per 3 bytes
+                    return (n * 3) // 4
+
+                def bytes_to_ms(nbytes: int) -> float:
+                    # 24 kHz mono, 16 bit => 2 bytes per sample
+                    samples = nbytes / 2.0
+                    return (samples / 24000.0) * 1000.0
+
+                while True:
+                    msg = await ws.receive_text()
+                    data = json.loads(msg)
+                    t = data.get("type")
+
+                    if t == "chunk":
+                        b64 = data["data"]
+                        accum_bytes += b64len_to_bytes(len(b64))
+                        await oai.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": b64
+                        }))
+
+                        # Commit endast om vi har nog med audio och ingen response är aktiv
+                        if (not response_state["inflight"]) and bytes_to_ms(accum_bytes) >= MIN_MS:
+                            commits += 1
+                            await oai.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            await oai.send(json.dumps({
+                                "type": "response.create",
+                                "response": {
+                                    "modalities": ["text"],
+                                    "instructions": "Transcribe the latest audio in Swedish only."
+                                }
+                            }))
+                            response_state["inflight"] = True
+                            await ws.send_json({
+                                "type": "log",
+                                "where": "server",
+                                "msg": f"commit #{commits}, ~{bytes_to_ms(accum_bytes):.0f}ms audio"
+                            })
+                            accum_bytes = 0
+
+                    elif t == "flush":
+                        if accum_bytes > 0 and not response_state["inflight"]:
+                            await oai.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            await oai.send(json.dumps({
+                                "type": "response.create",
+                                "response": {
+                                    "modalities": ["text"],
+                                    "instructions": "Transcribe the latest audio in Swedish only."
+                                }
+                            }))
+                            response_state["inflight"] = True
+                            await ws.send_json({
+                                "type": "log",
+                                "where": "server",
+                                "msg": "flush -> commit + response.create"
+                            })
+                            accum_bytes = 0
+
+                    elif t == "close":
+                        break
+
+            async def pump_oai_to_client():
+                """
+                Vidarebefordra löpande textdeltas till klienten.
+                Nyckeln är att lyssna på 'response.output_text.delta' / 'done' + frigöra inflight-flaggan på 'response.completed'.
+                """
+                async for raw in oai:
+                    try:
+                        ev = json.loads(raw)
+                    except Exception as ex:
+                        await ws.send_json({
+                            "type": "log",
+                            "where": "server",
+                            "msg": f"json parse error: {ex}"
+                        })
+                        continue
+
+                    et = ev.get("type") or ""
+
+                    # Nya generella text-streaming events
+                    if et == "response.output_text.delta":
+                        delta = ev.get("delta") or ""
+                        if delta:
+                            await ws.send_json({"type": "delta", "text": delta})
+                        continue
+
+                    if et == "response.output_text.done":
+                        text = ev.get("text") or ""
+                        await ws.send_json({"type": "done", "text": text})
+                        continue
+
+                    # ASR-specifika fallback-event (behåll)
+                    if et in (
+                        "conversation.item.input_audio_transcription.delta",
+                        "transcript.text.delta",
+                        "input_audio_transcription.delta",
+                    ):
+                        delta = ev.get("delta") or ev.get("text") or ev.get("transcript") or ""
+                        if delta:
+                            await ws.send_json({"type": "delta", "text": delta})
+                        continue
+
+                    if et in (
+                        "conversation.item.input_audio_transcription.completed",
+                        "transcript.text.done",
+                        "input_audio_transcription.completed",
+                    ):
+                        text = ev.get("transcript") or ev.get("text") or ""
+                        await ws.send_json({"type": "done", "text": text})
+                        continue
+
+                    # Markera att responsen är färdig: tillåt nästa commit+response
+                    if et == "response.completed":
+                        response_state["inflight"] = False
+                        await ws.send_json({
+                            "type": "log",
+                            "where": "server",
+                            "msg": "response.completed"
+                        })
+                        continue
+
+                    if et == "error":
+                        await ws.send_json({
+                            "type": "error",
+                            "message": ev.get("error", {}).get("message", str(ev))
+                        })
+                        continue
+
+            await asyncio.gather(pump_client_to_oai(), pump_oai_to_client())
+
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        try:
+            await ws.send_json({"type": "error", "message": str(e)})
+        finally:
+            with contextlib.suppress(Exception):
+                await ws.close()

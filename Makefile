@@ -19,13 +19,10 @@ endef
 
 help:
 	@echo "Targets:"
-	@echo "  make setup       - venv + deps (python & yarn) + start tmux"
-	@echo "  make dev         - start backend|frontend i två tmux-rutor"
-	@echo "  make backend     - endast backend"
-	@echo "  make frontend    - endast frontend"
-	@echo "  make lint        - ruff + mypy"
-	@echo "  make format      - black + ruff --fix"
-	@echo "  make test        - pytest"
+	@echo "  make setup    - venv + deps (python & yarn) + start tmux"
+	@echo "  make dev      - start backend|frontend i två tmux-rutor"
+	@echo "  make backend  - endast backend"
+	@echo "  make frontend - endast frontend"
 
 setup: venv python-deps frontend-deps dev
 
@@ -62,14 +59,3 @@ backend:
 
 frontend:
 	cd $(FRONTEND_DIR) && yarn dev --port $(FRONTEND_PORT)
-
-lint:
-	@$(call RUN_IN_VENV, ruff check .)
-	@$(call RUN_IN_VENV, mypy .)
-
-format:
-	@$(call RUN_IN_VENV, black .)
-	@$(call RUN_IN_VENV, ruff check --fix .)
-
-test:
-	@$(call RUN_IN_VENV, pytest -q)
