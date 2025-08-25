@@ -68,35 +68,35 @@ export function useLiveTranscribeWS() {
 
                 node.port.onmessage = (e: MessageEvent) => {
                     if (e.data?.type === 'ready') {
-                        inputRateRef.current = e.data.sampleRate || ctx.sampleRate
+                      inputRateRef.current = e.data.sampleRate || ctx.sampleRate
                     } else if (e.data?.type === 'chunk') {
-                        const f32: Float32Array = e.data.data
-                        // Lägg till i vår batch-accumulator
-                        f32ChunksRef.current.push(f32)
-                        f32SamplesRef.current += f32.length
-
-                        // Skicka ungefär var ~40ms (48000 * 0.04 = 1920 samples)
-                        const THRESH_SAMPLES = Math.floor(inputRateRef.current * 0.04)
-                        if (f32SamplesRef.current >= THRESH_SAMPLES) {
-                            const joined = concatFloat32(f32ChunksRef.current, f32SamplesRef.current)
-                            f32ChunksRef.current = []
-                            f32SamplesRef.current = 0
-
-                            const pcm16 = downsampleTo24k(joined, inputRateRef.current)
-                            const b = new Blob([pcm16.buffer], { type: 'application/octet-stream' })
-                            const reader = new FileReader()
-                            reader.onload = () => {
-                                const bytes = new Uint8Array(reader.result as ArrayBuffer)
-                                let binary = ''
-                                for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
-                                const b64 = btoa(binary)
-                                ws.send(JSON.stringify({ type: 'chunk', data: b64 }))
-                            }
-                            reader.readAsArrayBuffer(b)
+                      const f32: Float32Array = e.data.data
+          
+                      // --- BATCHNING: samla ~80ms innan vi skickar ---
+                      f32ChunksRef.current.push(f32)
+                      f32SamplesRef.current += f32.length
+          
+                      // 80ms @ 48kHz ≈ 3840 samples
+                      const THRESH_SAMPLES = Math.floor(inputRateRef.current * 0.08)
+                      if (f32SamplesRef.current >= THRESH_SAMPLES) {
+                        const joined = concatFloat32(f32ChunksRef.current, f32SamplesRef.current)
+                        f32ChunksRef.current = []
+                        f32SamplesRef.current = 0
+          
+                        const pcm16 = downsampleTo24k(joined, inputRateRef.current)
+                        const b = new Blob([pcm16.buffer], { type: 'application/octet-stream' })
+                        const reader = new FileReader()
+                        reader.onload = () => {
+                          const bytes = new Uint8Array(reader.result as ArrayBuffer)
+                          let binary = ''
+                          for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+                          const b64 = btoa(binary)
+                          ws.send(JSON.stringify({ type: 'chunk', data: b64 }))
                         }
+                        reader.readAsArrayBuffer(b)
+                      }
                     }
-                }
-
+                  }          
                 src.connect(node)
                 // Vill du slippa eko? kommentera nästa rad:
                 node.connect(ctx.destination)

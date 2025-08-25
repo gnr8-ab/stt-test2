@@ -121,17 +121,16 @@ async def ws_live(ws: WebSocket):
             session_update = {
                 "type": "session.update",
                 "session": {
-                    # Viktigt: pcm16 = 24 kHz mono
-                    "input_audio_format": "pcm16",
+                    "input_audio_format": "pcm16",  # 24 kHz mono
                     "input_audio_transcription": {
                         "model": TRANSCRIBE_MODEL,
                         "language": LANGUAGE,
                     },
-                    # OBS: använd server_vad för live-deltas; modellen skapar INTE svar själv
+                    # Använd server_vad men vi skapar responses själva
                     "turn_detection": {
                         "type": "server_vad",
-                        "silence_duration_ms": 350,
-                        "prefix_padding_ms": 200,
+                        "silence_duration_ms": 300,    # lite kortare för snabbare deltas
+                        "prefix_padding_ms": 150,
                         "threshold": 0.5,
                         "create_response": False,
                     },
@@ -144,25 +143,21 @@ async def ws_live(ws: WebSocket):
                 "msg": "session.update sent (pcm16/24kHz, server_vad, create_response=False)"
             })
 
-            # Delad status mellan pumparna: spåra om en response är 'in flight'
             response_state = {"inflight": False}
 
             async def pump_client_to_oai():
                 """
-                Ta emot batchede base64-PCM16 från klienten.
-                Commit + response.create endast när vi har >= MIN_MS och ingen response pågår.
+                Commit + response.create när vi har >= 200 ms audio och ingen response är pågående.
                 """
-                MIN_MS = 120  # OpenAI kräver >=100ms; vi tar lite marginal
+                MIN_MS = 200
                 accum_bytes = 0
                 commits = 0
 
                 def b64len_to_bytes(n: int) -> int:
-                    # Base64 ~ 4 tecken per 3 bytes
-                    return (n * 3) // 4
+                    return (n * 3) // 4  # approx: 4 tecken base64 ≈ 3 bytes
 
                 def bytes_to_ms(nbytes: int) -> float:
-                    # 24 kHz mono, 16 bit => 2 bytes per sample
-                    samples = nbytes / 2.0
+                    samples = nbytes / 2.0  # 16-bit -> 2 bytes/sample
                     return (samples / 24000.0) * 1000.0
 
                 while True:
@@ -178,7 +173,6 @@ async def ws_live(ws: WebSocket):
                             "audio": b64
                         }))
 
-                        # Commit endast om vi har nog med audio och ingen response är aktiv
                         if (not response_state["inflight"]) and bytes_to_ms(accum_bytes) >= MIN_MS:
                             commits += 1
                             await oai.send(json.dumps({"type": "input_audio_buffer.commit"}))
@@ -220,8 +214,7 @@ async def ws_live(ws: WebSocket):
 
             async def pump_oai_to_client():
                 """
-                Vidarebefordra löpande textdeltas till klienten.
-                Nyckeln är att lyssna på 'response.output_text.delta' / 'done' + frigöra inflight-flaggan på 'response.completed'.
+                Vidarebefordra *rinnande* textdeltas. Frigör inflight-flaggan på response.completed.
                 """
                 async for raw in oai:
                     try:
@@ -236,7 +229,7 @@ async def ws_live(ws: WebSocket):
 
                     et = ev.get("type") or ""
 
-                    # Nya generella text-streaming events
+                    # Streamade deltas (nya event)
                     if et == "response.output_text.delta":
                         delta = ev.get("delta") or ""
                         if delta:
@@ -248,7 +241,7 @@ async def ws_live(ws: WebSocket):
                         await ws.send_json({"type": "done", "text": text})
                         continue
 
-                    # ASR-specifika fallback-event (behåll)
+                    # ASR-fallback
                     if et in (
                         "conversation.item.input_audio_transcription.delta",
                         "transcript.text.delta",
@@ -268,7 +261,6 @@ async def ws_live(ws: WebSocket):
                         await ws.send_json({"type": "done", "text": text})
                         continue
 
-                    # Markera att responsen är färdig: tillåt nästa commit+response
                     if et == "response.completed":
                         response_state["inflight"] = False
                         await ws.send_json({
@@ -295,3 +287,4 @@ async def ws_live(ws: WebSocket):
         finally:
             with contextlib.suppress(Exception):
                 await ws.close()
+

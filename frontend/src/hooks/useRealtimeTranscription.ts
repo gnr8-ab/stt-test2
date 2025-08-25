@@ -57,11 +57,31 @@ export function useRealtimeTranscription() {
     const dc = pc.createDataChannel('oai-events')
     dcRef.current = dc
     dc.addEventListener('open', () => {
+      // 1) Tala om hur vi vill transkribera + låt VAD auto-starta responses
       dc.send(JSON.stringify({
         type: 'session.update',
         session: {
-          input_audio_transcription: { model: eph.transcription_model, language: eph.language },
-          turn_detection: { type: 'server_vad', silence_duration_ms: 200, prefix_padding_ms: 300, threshold: 0.5, create_response: false }
+          input_audio_transcription: {
+            model: eph.transcription_model,
+            language: eph.language
+          },
+          // Låt modellen skapa svar med VAD (ger stabil text utan att du gör response.create själv)
+          turn_detection: {
+            type: 'server_vad',
+            silence_duration_ms: 250,
+            prefix_padding_ms: 150,
+            threshold: 0.5,
+            create_response: true
+          }
+        }
+      }))
+
+      // 2) Kicka igång en första response ifall VAD inte hunnit triggas ännu
+      dc.send(JSON.stringify({
+        type: 'response.create',
+        response: {
+          modalities: ['text'],
+          instructions: 'Transcribe the latest audio in Swedish only.'
         }
       }))
     })
